@@ -1,0 +1,63 @@
+From 135b924df4c3d6ed94a5dff1c6a976bfbf408c32 Mon Sep 17 00:00:00 2001
+From: chenkaiyue <chenkaiyue2008@163.com>
+Date: Fri, 16 Jan 2026 14:47:53 +0800
+Subject: [PATCH] hicache: fix EAGLE mode hash inconsistency in storage
+ prefetch
+
+---
+ python/sglang/srt/managers/cache_controller.py | 8 ++++++++
+ python/sglang/srt/mem_cache/hiradix_cache.py   | 1 +
+ 2 files changed, 9 insertions(+)
+
+diff --git a/python/sglang/srt/managers/cache_controller.py b/python/sglang/srt/managers/cache_controller.py
+index 80174584e51d..d0194b905557 100644
+--- a/python/sglang/srt/managers/cache_controller.py
++++ b/python/sglang/srt/managers/cache_controller.py
+@@ -25,6 +25,7 @@
+     HiCacheStorageConfig,
+     HiCacheStorageExtraInfo,
+ )
++from sglang.srt.mem_cache.utils import convert_to_bigram_key
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+@@ -261,6 +262,7 @@ def __init__(
+         storage_backend_extra_config: Optional[dict] = None,
+         pp_rank: int = 0,
+         pp_size: int = 1,
++        is_eagle: bool = False,
+     ):
+         self.mem_pool_device_allocator = token_to_kv_pool_allocator
+         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
+@@ -271,6 +273,7 @@ def __init__(
+         self.enable_storage = False
+         self.pp_rank = pp_rank
+         self.pp_size = pp_size
++        self.is_eagle = is_eagle
+ 
+         if storage_backend is not None:
+             self.storage_backend_type = storage_backend
+@@ -687,6 +690,11 @@ def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+         tokens_to_fetch = operation.token_ids
+         prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
+ 
++        # EAGLE mode: convert tokens to bigram format for hash computation
++        # This ensures consistency with how tokens are stored (using bigram keys)
++        if self.is_eagle:
++            tokens_to_fetch = convert_to_bigram_key(tokens_to_fetch)
++
+         storage_query_count = 0
+         hash_value = []
+ 
+diff --git a/python/sglang/srt/mem_cache/hiradix_cache.py b/python/sglang/srt/mem_cache/hiradix_cache.py
+index 5a9e8715bb7e..e2b2f5f6d81f 100644
+--- a/python/sglang/srt/mem_cache/hiradix_cache.py
++++ b/python/sglang/srt/mem_cache/hiradix_cache.py
+@@ -116,6 +116,7 @@ def __init__(self, params: CacheInitParams, server_args: ServerArgs):
+             storage_backend_extra_config=extra_config,
+             pp_rank=self.pp_rank,
+             pp_size=self.pp_size,
++            is_eagle=params.is_eagle,
+         )
+         if self.enable_storage_metrics:
+             # TODO: support pp
