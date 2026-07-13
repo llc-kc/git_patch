@@ -1,0 +1,800 @@
+diff --git a/python/sglang/srt/managers/cache_controller.py b/python/sglang/srt/managers/cache_controller.py
+index 5215945c6..839d18af7 100644
+--- a/python/sglang/srt/managers/cache_controller.py
++++ b/python/sglang/srt/managers/cache_controller.py
+@@ -27,7 +27,9 @@ from sglang.srt.mem_cache.hicache_storage import (
+     HiCacheStorageExtraInfo,
+     PoolName,
+     PoolTransfer,
++    PoolTransferResult,
+     SidecarPoolSpec,
++    is_rank_local_draft_pool,
+ )
+ 
+ if TYPE_CHECKING:
+@@ -88,9 +90,7 @@ class LayerDoneCounter:
+ 
+     def update_producer(self):
+         self.producer_index = (self.producer_index + 1) % self.num_counters
+-        assert self.events[
+-            self.producer_index
+-        ].finish_event.query(), (
++        assert self.events[self.producer_index].finish_event.query(), (
+             "Producer finish event should be ready before being reused."
+         )
+         return self.producer_index
+@@ -483,7 +483,7 @@ class HiCacheController:
+                 f"{storage_backend!r} while MLA/NSA host-memory dedup is "
+                 f"active: non-rank-0 attn-TP ranks hold dummy host pools "
+                 f"(kv_buffer=None) and this backend would dereference them. "
+-                f"Only None/''/'file' backends can attach later in dedup "
++                f"Only None/''/'file'/'mooncake' backends can attach later in dedup "
+                 f"mode. Restart the server with "
+                 f"--hicache-storage-backend={storage_backend} to use this "
+                 f"backend (every rank will then keep a full host pool)."
+@@ -521,14 +521,10 @@ class HiCacheController:
+             self.storage_backend = StorageBackendFactory.create_backend(
+                 storage_backend, self.storage_config, self.mem_pool_host
+             )
+-            # Dummy host pool: no buffer to register; this rank never reads L3.
+-            if getattr(self.mem_pool_host, "_is_dummy", False):
+-                logger.info(
+-                    "Skipping register_mem_pool_host on dummy (non-rank-0 dedup) "
+-                    "host pool with no KV buffer."
+-                )
+-            else:
+-                self.storage_backend.register_mem_pool_host(self.mem_pool_host)
++            # Registration also binds the logical anchor object. Mooncake's
++            # implementation detects kv_buffer=None and skips buffer pinning,
++            # while retaining the anchor for v1/v2 logical-target semantics.
++            self.storage_backend.register_mem_pool_host(self.mem_pool_host)
+ 
+             self.enable_storage = True
+             # todo: threshold policy for prefetching
+@@ -665,9 +661,9 @@ class HiCacheController:
+         should_split_heads = False
+ 
+         if tp_lcm_size:
+-            assert (
+-                tp_lcm_size % self.tp_size == 0
+-            ), "tp_lcm_size must be divisible by tp_size."
++            assert tp_lcm_size % self.tp_size == 0, (
++                "tp_lcm_size must be divisible by tp_size."
++            )
+             should_split_heads = (
+                 not is_rank_replicated
+                 and self.mem_pool_host.layout == "page_head"
+@@ -700,6 +696,8 @@ class HiCacheController:
+         self.load_queue.clear()
+         self.ack_write_queue.clear()
+         self.ack_load_queue.clear()
++        for _spec, entry in self._draft_pools():
++            entry.host_pool.clear()
+         if self.enable_storage:
+             self.prefetch_thread.join()
+             self.backup_thread.join()
+@@ -751,9 +749,24 @@ class HiCacheController:
+         finish_event = device_module.Event()
+ 
+         if self._mla_skip_host_io:
+-            # Dummy host pool on this rank: skip D2H, just ack.
++            # The target pool is a dummy on this rank, but speculative draft
++            # pools are TP-rank-local and must still be copied to their real
++            # per-rank host pools.
+             start_event.record()
+-            finish_event.record()
++            if self.has_draft:
++                host_indices, device_indices = self.move_indices(
++                    op.host_indices, op.device_indices
++                )
++                with device_module.stream(self.write_stream):
++                    start_event.wait(self.write_stream)
++                    self._backup_rank_local_draft_pools(host_indices, device_indices)
++                    finish_event.record()
++                    if host_indices.is_cuda:
++                        host_indices.record_stream(self.write_stream)
++                    if device_indices.is_cuda:
++                        device_indices.record_stream(self.write_stream)
++            else:
++                finish_event.record()
+             self.ack_write_queue.append(
+                 HiCacheAck(start_event, finish_event, op.node_ids)
+             )
+@@ -796,6 +809,19 @@ class HiCacheController:
+ 
+         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+ 
++    def _backup_rank_local_draft_pools(
++        self, host_indices: torch.Tensor, device_indices: torch.Tensor
++    ) -> None:
++        for spec, entry in self._kv_indexed_draft_pools():
++            if not is_rank_local_draft_pool(spec.pool_name):
++                continue
++            entry.host_pool.backup_from_device_all_layer(
++                entry.device_pool,
++                host_indices,
++                device_indices,
++                self.io_backend,
++            )
++
+     def load(
+         self,
+         host_indices: torch.Tensor,
+@@ -903,8 +929,14 @@ class HiCacheController:
+             producer_event.start_event.wait(self.load_stream)
+             if self.mla_broadcaster.is_src:
+                 self._load_mla_on_src_rank(op)
++
++            # Draft KV is rank-local for EAGLE/MTP/DFLASH.  Every rank loads
++            # its own draft sidecars; only target MLA/DSA state is broadcast.
++            self._load_rank_local_draft_pools(op)
++
++            if self.mla_broadcaster.is_src:
+                 # "direct" may issue H2D off load_stream; land it fully
+-                # before the broadcast reads the device KV buffer.
++                # before the broadcast reads the device target KV buffer.
+                 self.load_stream.synchronize()
+ 
+             self.mla_broadcaster.broadcast_loaded(op.device_indices, self.load_stream)
+@@ -920,6 +952,28 @@ class HiCacheController:
+         )
+         return producer_id
+ 
++    def _load_rank_local_draft_pools(self, op: CacheOperation) -> None:
++        if not self.has_draft:
++            return
++        host_indices, device_indices = self.move_indices(
++            op.host_indices, op.device_indices
++        )
++        for spec, entry in self._kv_indexed_draft_pools():
++            if not is_rank_local_draft_pool(spec.pool_name):
++                continue
++            for layer_id in range(entry.host_pool.layer_num):
++                entry.host_pool.load_to_device_per_layer(
++                    entry.device_pool,
++                    host_indices,
++                    device_indices,
++                    layer_id,
++                    self.io_backend,
++                )
++        if host_indices.is_cuda:
++            host_indices.record_stream(self.load_stream)
++        if device_indices.is_cuda:
++            device_indices.record_stream(self.load_stream)
++
+     def _load_mla_on_src_rank(self, op: CacheOperation) -> None:
+         """Src-rank H2D; subclasses override to add their pool transfers."""
+         host_indices, device_indices = self.move_indices(
+@@ -1136,10 +1190,20 @@ class HiCacheController:
+                 break  # Operation terminated by controller
+ 
+     def _page_transfer(self, operation):
+-        # Dummy host pool: only the src rank reads L3; mark complete so the
+-        # MIN-synced cross-rank accounting stays consistent.
++        # Only target L3 IO is skipped on a non-owner dedup rank. Draft
++        # sidecars are rank-local and still have to be fetched on every rank.
+         if self._mla_skip_host_io:
+-            operation.completed_tokens += len(operation.hash_value) * self.page_size
++            for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
++                batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
++                batch_host_indices = operation.host_indices[
++                    i * self.page_size : (i + len(batch_hashes)) * self.page_size
++                ]
++                if self.has_draft and not self._draft_page_get(
++                    batch_hashes, batch_host_indices
++                ):
++                    operation.mark_terminate()
++                    break
++                operation.completed_tokens += len(batch_hashes) * self.page_size
+             return
+         # Transfer batch by batch
+         prefix_keys = operation.prefix_keys
+@@ -1149,11 +1213,12 @@ class HiCacheController:
+                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
+             ]
+ 
+-            # Best-effort draft L3 read before publishing target completion.
+-            # Otherwise wait_complete can race and load back target KV before
+-            # draft KV reaches host memory.
++            # Draft is required speculative state. Load it before publishing
++            # target completion so wait_complete cannot observe a partial hit.
+             if self.has_draft:
+-                self._draft_page_get(batch_hashes, batch_host_indices)
++                if not self._draft_page_get(batch_hashes, batch_host_indices):
++                    operation.mark_terminate()
++                    break
+ 
+             prev_completed_tokens = operation.completed_tokens
+             # Get one batch token, and update the completed_tokens if succeed
+@@ -1211,7 +1276,21 @@ class HiCacheController:
+         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
+             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
+             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+-            hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
++            if self.has_draft and self.storage_backend_type == "mooncake":
++                hit_result: PoolTransferResult = self.storage_backend.batch_exists_v2(
++                    batch_hashes,
++                    self._draft_pool_transfers(batch_hashes, None),
++                    extra_info,
++                )
++                hit_page_num = hit_result.kv_hit_pages
++            elif self._mla_skip_host_io:
++                # The owner rank checks the shared target objects; MIN sync in
++                # prefetch_thread_func propagates its prefix to this rank.
++                hit_page_num = len(batch_hashes)
++            else:
++                hit_page_num = self.storage_backend.batch_exists(
++                    batch_hashes, extra_info
++                )
+             hash_value.extend(batch_hashes[:hit_page_num])
+             storage_query_count += hit_page_num * self.page_size
+             if hit_page_num < len(batch_hashes):
+@@ -1297,33 +1376,39 @@ class HiCacheController:
+             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
+         )
+ 
+-    def _draft_page_set(self, hash_values, host_indices) -> None:
+-        """Best-effort write draft KV pages to L3 alongside the target backup."""
++    def _draft_page_set(self, hash_values, host_indices) -> bool:
++        """Write required rank-local draft KV pages alongside the target."""
+         if self.draft_page_set_func is None:
+-            return
++            return True
+         try:
+-            self.draft_page_set_func(hash_values, host_indices)
++            result = self.draft_page_set_func(hash_values, host_indices)
++            if isinstance(result, dict) and any(not all(v) for v in result.values()):
++                return False
++            return True
+         except Exception:
+-            logger.debug(
+-                "Draft L3 write failed (best-effort), skipping.", exc_info=True
+-            )
++            logger.warning("Draft L3 write failed.", exc_info=True)
++            return False
+ 
+-    def _draft_page_get(self, hash_values, host_indices) -> None:
+-        """Best-effort read draft KV pages from L3 (mirrors `_draft_page_set`)."""
++    def _draft_page_get(self, hash_values, host_indices) -> bool:
++        """Read required rank-local draft KV pages from L3."""
+         if self.draft_page_get_func is None:
+-            return
++            return True
+         try:
+-            self.draft_page_get_func(hash_values, host_indices)
++            result = self.draft_page_get_func(hash_values, host_indices)
++            if isinstance(result, dict) and any(not all(v) for v in result.values()):
++                return False
++            return True
+         except Exception:
+-            logger.debug("Draft L3 read failed (best-effort), skipping.", exc_info=True)
++            logger.warning("Draft L3 read failed.", exc_info=True)
++            return False
+ 
+     def _draft_page_set_v2(self, hash_values, host_indices) -> None:
+-        self.storage_backend.batch_set_v2(
++        return self.storage_backend.batch_set_v2(
+             self._draft_pool_transfers(hash_values, host_indices)
+         )
+ 
+     def _draft_page_get_v2(self, hash_values, host_indices) -> None:
+-        self.storage_backend.batch_get_v2(
++        return self.storage_backend.batch_get_v2(
+             self._draft_pool_transfers(hash_values, host_indices)
+         )
+ 
+@@ -1370,19 +1455,27 @@ class HiCacheController:
+             batch_host_indices = operation.host_indices[
+                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
+             ]
+-            # Set one batch token, and record if success.
+-            # todo: allow partial success
++            # Target MLA/DSA is shared and written by its owner only. Draft
++            # sidecars below are rank-local and are written by every rank.
+             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+-            success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
++            success = True
++            if not self.backup_skip:
++                success = self.page_set_func(
++                    batch_hashes, batch_host_indices, extra_info
++                )
+             if not success:
+                 logger.warning(
+                     f"Write page to storage: {len(batch_hashes)} pages failed."
+                 )
+                 break
+ 
+-            # Best-effort draft L3 write alongside target.
+             if self.has_draft:
+-                self._draft_page_set(batch_hashes, batch_host_indices)
++                if not self._draft_page_set(batch_hashes, batch_host_indices):
++                    logger.warning(
++                        "Write draft pages to storage: %d pages failed.",
++                        len(batch_hashes),
++                    )
++                    break
+ 
+             if prefix_keys and len(prefix_keys) > 0:
+                 prefix_keys += batch_hashes
+@@ -1398,8 +1491,7 @@ class HiCacheController:
+                 if operation is None:
+                     continue
+ 
+-                if not self.backup_skip:
+-                    self._page_backup(operation)
++                self._page_backup(operation)
+                 self.ack_backup_queue.put(operation)
+ 
+             except Empty:
+diff --git a/python/sglang/srt/mem_cache/hicache_storage.py b/python/sglang/srt/mem_cache/hicache_storage.py
+index 04af21e33..97c331977 100644
+--- a/python/sglang/srt/mem_cache/hicache_storage.py
++++ b/python/sglang/srt/mem_cache/hicache_storage.py
+@@ -80,6 +80,26 @@ class PoolName(str, Enum):
+         return self.value
+ 
+ 
++RANK_LOCAL_DRAFT_POOLS = frozenset(
++    {
++        PoolName.DRAFT,
++        PoolName.DRAFT_INDEXER,
++        PoolName.DRAFT_SWA,
++    }
++)
++
++
++def is_rank_local_draft_pool(pool_name: PoolName) -> bool:
++    """Whether a HiCache pool contains TP-rank-local speculative state.
++
++    Target MLA/DSA state is replicated across attention-TP ranks and may be
++    deduplicated.  Draft state is sharded by the draft model, even when its
++    concrete host-pool class happens to be MLA-shaped, so it must never share
++    L2 data or L3 object keys across ranks.
++    """
++    return pool_name in RANK_LOCAL_DRAFT_POOLS
++
++
+ class PoolHitPolicy(str, Enum):
+     """Hit policy for batch_exists_v2 per-pool prefix matching.
+ 
+diff --git a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
+index 4b0901a75..c54c1947e 100644
+--- a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
++++ b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py
+@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.hicache_storage import (
+     PoolName,
+     PoolTransfer,
+     PoolTransferResult,
++    is_rank_local_draft_pool,
+ )
+ from sglang.srt.mem_cache.memory_pool_host import PoolEntry
+ from sglang.srt.mem_cache.mla_host_dedup import (
+@@ -434,9 +435,30 @@ class HybridCacheController(BaseHiCacheController):
+         start_event = device_module.Event()
+         finish_event = device_module.Event()
+         if self._mla_skip_host_io:
+-            # MLA/DSA dedup: dummy host pools on this rank; skip D2H, just ack.
++            # Target MLA/DSA pools are dummy here, but draft sidecars are
++            # rank-local real pools and still require D2H backup.
+             start_event.record()
+-            finish_event.record()
++            host_indices, device_indices, resolved_pool_transfers = (
++                self.move_hybrid_indices(op)
++            )
++            draft_transfers = self._rank_local_draft_transfers(resolved_pool_transfers)
++            if self.has_draft or draft_transfers:
++                with device_module.stream(self.write_stream):
++                    start_event.wait(self.write_stream)
++                    if self.has_draft:
++                        self._backup_rank_local_draft_pools(
++                            host_indices, device_indices
++                        )
++                    self._backup_rank_local_pool_transfers(draft_transfers)
++                    finish_event.record()
++                    self._record_transfer_indices_on_stream(
++                        self.write_stream,
++                        host_indices,
++                        device_indices,
++                        draft_transfers,
++                    )
++            else:
++                finish_event.record()
+             self.ack_write_queue.append(
+                 HiCacheAck(start_event, finish_event, op.node_ids)
+             )
+@@ -495,6 +517,30 @@ class HybridCacheController(BaseHiCacheController):
+             )
+         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+ 
++    @staticmethod
++    def _rank_local_draft_transfers(
++        pool_transfers: Optional[list[PoolTransfer]],
++    ) -> list[PoolTransfer]:
++        return [
++            transfer
++            for transfer in pool_transfers or []
++            if is_rank_local_draft_pool(transfer.name)
++        ]
++
++    def _backup_rank_local_pool_transfers(
++        self, pool_transfers: list[PoolTransfer]
++    ) -> None:
++        for transfer in pool_transfers:
++            entry = self.mem_pool_host.entry_map.get(transfer.name)
++            if entry is None or transfer.host_indices is None:
++                continue
++            entry.host_pool.backup_from_device_all_layer(
++                entry.device_pool,
++                transfer.host_indices,
++                transfer.device_indices,
++                self.io_backend,
++            )
++
+     def load(
+         self,
+         host_indices: torch.Tensor,
+@@ -605,10 +651,15 @@ class HybridCacheController(BaseHiCacheController):
+         return producer_id
+ 
+     def _load_mla_on_src_rank(self, op: CacheOperation) -> None:
+-        """Src-rank H2D including the extra pool transfers (DSA indexer)."""
++        """Src-rank H2D for shared target pools (including DSA indexer)."""
+         host_indices, device_indices, resolved_pool_transfers = (
+             self.move_hybrid_indices(op)
+         )
++        target_pool_transfers = [
++            transfer
++            for transfer in resolved_pool_transfers or []
++            if not is_rank_local_draft_pool(transfer.name)
++        ]
+         for i in range(self.layer_num):
+             self.mem_pool_host.load_to_device_per_layer(
+                 self.mem_pool_device,
+@@ -616,13 +667,43 @@ class HybridCacheController(BaseHiCacheController):
+                 device_indices,
+                 i,
+                 self.io_backend,
+-                pool_transfers=resolved_pool_transfers,
++                pool_transfers=target_pool_transfers,
+             )
+         self._record_transfer_indices_on_stream(
+             self.load_stream,
+             host_indices,
+             device_indices,
+-            resolved_pool_transfers,
++            target_pool_transfers,
++        )
++
++    def _load_rank_local_draft_pools(self, op: CacheOperation) -> None:
++        # HiRadix registers draft pools directly on the controller, while the
++        # unified radix cache represents them as ordinary sidecar transfers.
++        super()._load_rank_local_draft_pools(op)
++        host_indices, device_indices, resolved_pool_transfers = (
++            self.move_hybrid_indices(op)
++        )
++        draft_transfers = self._rank_local_draft_transfers(resolved_pool_transfers)
++        for transfer in draft_transfers:
++            entry = self.mem_pool_host.entry_map.get(transfer.name)
++            if entry is None or transfer.host_indices is None:
++                continue
++            for layer_id in range(self.layer_num):
++                local_layer_id = entry.layer_mapper(layer_id)
++                if local_layer_id is None:
++                    continue
++                entry.host_pool.load_to_device_per_layer(
++                    entry.device_pool,
++                    transfer.host_indices,
++                    transfer.device_indices,
++                    local_layer_id,
++                    self.io_backend,
++                )
++        self._record_transfer_indices_on_stream(
++            self.load_stream,
++            host_indices,
++            device_indices,
++            draft_transfers,
+         )
+ 
+     def _record_transfer_indices_on_stream(
+@@ -716,9 +797,29 @@ class HybridCacheController(BaseHiCacheController):
+         extra_info = HiCacheStorageExtraInfo(
+             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
+         )
+-        if operation.pool_transfers:
++        controller_draft_transfers = (
++            self._draft_pool_transfers(hash_value, None)
++            if self.has_draft and self.storage_backend_type == "mooncake"
++            else []
++        )
++        if self._mla_skip_host_io:
++            # Shared target/indexer objects are checked by the owner rank.
++            # This rank still constrains the common prefix by its local draft.
++            draft_transfers = self._rank_local_draft_transfers(operation.pool_transfers)
++            draft_transfers.extend(controller_draft_transfers)
++            if draft_transfers:
++                hit_result = self.storage_backend.batch_exists_v2(
++                    hash_value, draft_transfers, extra_info
++                )
++            else:
++                hit_result = PoolTransferResult(
++                    kv_hit_pages=len(hash_value), extra_pool_hit_pages={}
++                )
++        elif operation.pool_transfers or controller_draft_transfers:
++            pool_transfers = list(operation.pool_transfers or [])
++            pool_transfers.extend(controller_draft_transfers)
+             hit_result = self.storage_backend.batch_exists_v2(
+-                hash_value, operation.pool_transfers, extra_info
++                hash_value, pool_transfers, extra_info
+             )
+         else:
+             kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
+@@ -763,12 +864,29 @@ class HybridCacheController(BaseHiCacheController):
+         return host_indices, device_indices, resolved_pool_transfers
+ 
+     def _page_transfer(self, operation):
+-        # Dummy host pools (KV and indexer): no L3 reads on this rank. Must
+-        # precede super()._page_transfer and the sidecar batch_get below;
+-        # pool_transfers_done lets this rank pass the all-reduced termination
+-        # check.
++        # Shared target pools are logical/dummy on this rank, but draft pools
++        # are real rank-local state and must still be fetched.
+         if self._mla_skip_host_io:
+-            operation.completed_tokens += len(operation.hash_value) * self.page_size
++            # Handles controller-registered HiRadix draft pools and advances
++            # the logical target completion count without touching target IO.
++            super()._page_transfer(operation)
++            if operation.is_terminated():
++                operation.pool_transfers_done = True
++                return
++            draft_transfers = self._rank_local_draft_transfers(operation.pool_transfers)
++            if draft_transfers:
++                self._sync_trailing_keys(
++                    draft_transfers,
++                    operation.hash_value,
++                    len(operation.hash_value),
++                )
++                self._resolve_sidecar_derived_pool_transfers(operation)
++                results = self.storage_backend.batch_get_v2(draft_transfers)
++                operation.pool_storage_result.update_extra_pool_hit_pages(results)
++                if any(not all(pool_results) for pool_results in results.values()):
++                    operation.mark_terminate()
++                    operation.pool_transfers_done = True
++                    return
+             operation.pool_transfers_done = True
+             return
+ 
+@@ -786,14 +904,21 @@ class HybridCacheController(BaseHiCacheController):
+             self._resolve_sidecar_derived_pool_transfers(operation)
+             results = self.storage_backend.batch_get_v2(operation.pool_transfers)
+             operation.pool_storage_result.update_extra_pool_hit_pages(results)
++            if any(not all(pool_results) for pool_results in results.values()):
++                operation.mark_terminate()
+         operation.pool_transfers_done = True
+ 
+     def _page_backup(self, operation):
+         # Backup extra pools
+-        if operation.pool_transfers:
++        pool_transfers = operation.pool_transfers
++        if self.backup_skip:
++            pool_transfers = self._rank_local_draft_transfers(pool_transfers)
++        if pool_transfers:
+             self._resolve_sidecar_derived_pool_transfers(operation)
+-            results = self.storage_backend.batch_set_v2(operation.pool_transfers)
++            results = self.storage_backend.batch_set_v2(pool_transfers)
+             operation.pool_storage_result.update_extra_pool_hit_pages(results)
++            if any(not all(pool_results) for pool_results in results.values()):
++                return
+ 
+         # Backup kv pools
+         super()._page_backup(operation)
+diff --git a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py
+index e2e365bea..f9b2be4a0 100644
+--- a/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py
++++ b/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py
+@@ -711,10 +711,13 @@ def build_full_draft_pools(
+         MHATokenToKVPool,
+         MLATokenToKVPool,
+     )
++    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+ 
+     pool = draft_kv_pool
+     if isinstance(pool, HybridLinearKVPool):
+         pool = pool.full_kv_pool
++    elif isinstance(pool, SWAKVPool):
++        pool = pool.full_kv_pool
+ 
+     if not isinstance(pool, (MHATokenToKVPool, MLATokenToKVPool)):
+         return [], []
+@@ -1164,12 +1167,14 @@ class _DsaStrategy(StackStrategy):
+             storage_backend=storage_backend,
+             use_mla=use_mla,
+             override_kv_cache_dim=full_kv_pool.kv_cache_dim,
+-            sidecar_host_pool_factory=lambda kv_host_pool, idx_is_dummy: DSAIndexerPoolHost(
+-                full_kv_pool,
+-                kv_host_pool,
+-                server_args.hicache_mem_layout,
+-                allocator_type=server_args.hicache_storage_backend,
+-                is_dummy=idx_is_dummy,
++            sidecar_host_pool_factory=lambda kv_host_pool, idx_is_dummy: (
++                DSAIndexerPoolHost(
++                    full_kv_pool,
++                    kv_host_pool,
++                    server_args.hicache_mem_layout,
++                    allocator_type=server_args.hicache_storage_backend,
++                    is_dummy=idx_is_dummy,
++                )
+             ),
+             prefetch_threshold=prefetch_threshold,
+             model_name=model_name,
+@@ -1669,12 +1674,14 @@ def attach_hybrid_dsa_pool_to_hiradix_cache(
+             use_mla=True,
+             override_kv_cache_dim=kv.kv_cache_dim,
+             prefetch_threshold=prefetch_threshold,
+-            sidecar_host_pool_factory=lambda kv_host_pool, idx_is_dummy: DSAIndexerPoolHost(
+-                kv,
+-                kv_host_pool,
+-                server_args.hicache_mem_layout,
+-                allocator_type=server_args.hicache_storage_backend,
+-                is_dummy=idx_is_dummy,
++            sidecar_host_pool_factory=lambda kv_host_pool, idx_is_dummy: (
++                DSAIndexerPoolHost(
++                    kv,
++                    kv_host_pool,
++                    server_args.hicache_mem_layout,
++                    allocator_type=server_args.hicache_storage_backend,
++                    is_dummy=idx_is_dummy,
++                )
+             ),
+             model_name=server_args.served_model_name,
+             storage_backend_extra_config=extra_config,
+diff --git a/python/sglang/srt/mem_cache/mla_host_dedup.py b/python/sglang/srt/mem_cache/mla_host_dedup.py
+index 4b4a24882..1a519ca1a 100644
+--- a/python/sglang/srt/mem_cache/mla_host_dedup.py
++++ b/python/sglang/srt/mem_cache/mla_host_dedup.py
+@@ -36,10 +36,10 @@ from sglang.srt.utils import is_cuda
+ logger = logging.getLogger(__name__)
+ 
+ 
+-# Backends that never touch the host KV buffer directly, so they tolerate
+-# the buffer-less dummy pools. RDMA/registered backends (mooncake/eic/simm/
+-# hf3fs/nixl/aibrix) pin or register the buffer — dedup stays off for them.
+-_DEDUP_COMPATIBLE_STORAGE = frozenset({None, "", "file"})
++# Backends that tolerate a logical target anchor with no host KV buffer.
++# Mooncake keeps real per-rank draft sidecars on non-owner ranks. Other RDMA
++# backends pin or register the target buffer and therefore remain excluded.
++_DEDUP_COMPATIBLE_STORAGE = frozenset({None, "", "file", "mooncake"})
+ 
+ 
+ def storage_supports_host_dedup(storage_backend: Optional[str]) -> bool:
+diff --git a/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py b/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
+index 0aaa20042..739914a01 100644
+--- a/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
++++ b/python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py
+@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
+     PoolName,
+     PoolTransfer,
+     PoolTransferResult,
++    is_rank_local_draft_pool,
+ )
+ from sglang.srt.mem_cache.memory_pool_host import MLATokenToKVPoolHost
+ from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
+@@ -536,9 +537,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
+             if self.enable_pp:
+                 self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
+                 self.mla_suffix = f"{self.pp_rank}"
++                self.rank_local_suffix = f"{self.local_rank}_{self.pp_rank}"
+             else:
+                 self.mha_suffix = f"{self.local_rank}"
+                 self.mla_suffix = ""
++                self.rank_local_suffix = f"{self.local_rank}"
+ 
+             self.storage_config = storage_config
+             self.split_factor = 0
+@@ -726,16 +729,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
+             # `{rank}_k` / `{rank}_k` + `{rank}_v` keys.
+             draft_pool = self.registered_pools.get(PoolName.DRAFT)
+             if isinstance(draft_pool, MLATokenToKVPoolHost):
+-                suffixes = [f"_{self.mla_suffix}_{PoolName.DRAFT}_k"]
++                suffixes = [f"_{self.rank_local_suffix}_{PoolName.DRAFT}_k"]
+             else:
+                 suffixes = [
+-                    f"_{self.mha_suffix}_{PoolName.DRAFT}_k",
+-                    f"_{self.mha_suffix}_{PoolName.DRAFT}_v",
++                    f"_{self.rank_local_suffix}_{PoolName.DRAFT}_k",
++                    f"_{self.rank_local_suffix}_{PoolName.DRAFT}_v",
+                 ]
++        elif is_rank_local_draft_pool(pool_name):
++            suffixes = [f"_{self.rank_local_suffix}_{pool_name}"]
+         elif pool_name in (
+             PoolName.INDEXER,
+-            PoolName.DRAFT_INDEXER,
+-            PoolName.DRAFT_SWA,
+             PoolName.DEEPSEEK_V4_C4,
+             PoolName.DEEPSEEK_V4_C4_INDEXER,
+             PoolName.DEEPSEEK_V4_C128,
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index 29c540579..64ed6645b 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -283,6 +283,18 @@ class DFlashWorkerV2(BaseSpecWorker):
+             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+         )
+ 
++    def hicache_draft_pool_builders(self):
++        """Expose all DFLASH draft KV layouts as rank-local HiCache pools."""
++        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
++            build_full_draft_pools,
++            build_swa_draft_pools,
++        )
++
++        return (
++            build_full_draft_pools,
++            build_swa_draft_pools,
++        )
++
+     def init_attention_backends(self):
+         self._draft_worker.init_attention_backends()
+ 
+@@ -1168,7 +1180,9 @@ class DFlashWorkerV2(BaseSpecWorker):
+         ]
+         self._accept_bonus_buffer_cap = new_cap
+ 
+-    def _next_accept_bonus_buffers(self, bs: int) -> tuple[
++    def _next_accept_bonus_buffers(
++        self, bs: int
++    ) -> tuple[
+         torch.Tensor,
+         torch.Tensor,
+         torch.Tensor,
+diff --git a/test/registered/unit/mem_cache/test_mooncake_group_semantics.py b/test/registered/unit/mem_cache/test_mooncake_group_semantics.py
+index e41ae493b..1be41d8b2 100644
+--- a/test/registered/unit/mem_cache/test_mooncake_group_semantics.py
++++ b/test/registered/unit/mem_cache/test_mooncake_group_semantics.py
+@@ -271,6 +271,47 @@ def _make_store(
+ 
+ 
+ class TestMooncakeGroupSemantics(CustomTestCase):
++    def test_draft_object_keys_are_rank_local_for_mla_target(self):
++        store, _ = _make_store(is_mla_model=True, tp_rank=3, tp_size=4)
++        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
++            MLATokenToKVPoolHost,
++        )
++
++        draft_pool = object.__new__(MLATokenToKVPoolHost)
++        draft_pool.kv_buffer = torch.empty((32,), dtype=torch.uint8)
++        store.register_mem_host_pool_v2(draft_pool, PoolName.DRAFT)
++
++        keys, multiplier = store._get_hybrid_page_component_keys(
++            ["page0"], PoolTransfer(name=PoolName.DRAFT)
++        )
++
++        self.assertEqual(multiplier, 1)
++        self.assertEqual(keys, ["page0_3_draft_k"])
++
++    def test_mha_draft_object_keys_are_rank_local_for_mla_target(self):
++        store, _ = _make_store(is_mla_model=True, tp_rank=1, tp_size=4)
++        draft_pool = FakeHostKVCache(objects_per_page=2)
++        store.register_mem_host_pool_v2(draft_pool, PoolName.DRAFT)
++
++        keys, multiplier = store._get_hybrid_page_component_keys(
++            ["page0"], PoolTransfer(name=PoolName.DRAFT)
++        )
++
++        self.assertEqual(multiplier, 2)
++        self.assertEqual(keys, ["page0_1_draft_k", "page0_1_draft_v"])
++
++    def test_draft_sidecar_keys_are_rank_local(self):
++        store, _ = _make_store(is_mla_model=True, tp_rank=2, tp_size=4)
++        indexer_pool = FakeIndexerPool()
++        store.register_mem_host_pool_v2(indexer_pool, PoolName.DRAFT_INDEXER)
++
++        keys, multiplier = store._get_hybrid_page_component_keys(
++            ["page0"], PoolTransfer(name=PoolName.DRAFT_INDEXER)
++        )
++
++        self.assertEqual(multiplier, 1)
++        self.assertEqual(keys, ["page0_2_draft_indexer"])
++
+     def test_group_id_detection_uses_class_attribute_without_instantiating(self):
+         fake_store_cls = _fake_store_class()
+         with patch.dict(
